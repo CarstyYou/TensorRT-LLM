@@ -873,7 +873,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-        if is_sm_100f():
+        if is_sm_100f() or get_sm_version() == 120:
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):
                 expert_ids.update(
@@ -892,7 +892,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
 
     def post_load_weights(self, module: torch.nn.Module):
         super().post_load_weights(module)
-        if is_sm_100f():
+        if is_sm_100f() or get_sm_version() == 120:
             transfromed_w3_w1_scale = transform_sf_into_required_layout(
                 module.quant_scales[0],
                 mn=module.w3_w1_weight.shape[1],

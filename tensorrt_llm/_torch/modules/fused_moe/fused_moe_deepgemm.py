@@ -6,7 +6,7 @@ import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
@@ -329,6 +329,12 @@ def deepgemm_fp8_group_blockwise_gemm(
     assert d.stride(-1) == 1
 
     # Transform SFA and SFB into compute-required layout
+
+    if get_sm_version() == 120:
+        assert hasattr(torch.ops.trtllm, "fp8_block_scaling_moe_gemm_out")
+        torch.ops.trtllm.fp8_block_scaling_moe_gemm_out(a, b, sfa, sfb,
+                                                        masked_m, expected_m, d)
+        return
 
     deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,

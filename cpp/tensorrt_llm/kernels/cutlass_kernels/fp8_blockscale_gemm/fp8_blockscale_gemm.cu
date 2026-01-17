@@ -94,6 +94,13 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
     void const* mat_b, int64_t const* problem_m_offsets, size_t num_problems, size_t expected_m, size_t shape_n,
     size_t shape_k, cudaStream_t stream, float const* scales_a, float const* scales_b)
 {
+    auto arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 120)
+    {
+        moe_gemm_dispatch_sm120(mat_a, mat_b, mat_d, problem_m_offsets, num_problems, expected_m, shape_n, shape_k,
+            stream, scales_a, scales_b);
+        return;
+    }
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
 

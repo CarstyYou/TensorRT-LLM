@@ -719,7 +719,7 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -759,7 +759,73 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
+    launch_config.blockDim = GemmKernel::get_block_shape();
+    launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
+    launch_config.stream = stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
+
+    result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
+}
+
+void moe_gemm_dispatch_sm120(void const* mat_a, void const* mat_b, void* mat_d, int64_t const* problem_m_offsets,
+    size_t num_problems, size_t max_shape_m, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a,
+    float const* scales_b, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    using ElementInput = cute::float_e4m3_t;
+    using ElementOutput = cute::bfloat16_t;
+    using ElementAccum = float;
+    using ElementBlockScale = int32_t;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
+    using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
+    using Params = typename GemmKernel::Params;
+    using Arguments = typename GemmKernel::Arguments;
+    using ProblemShape = typename GemmKernel::ProblemShape;
+    ProblemShape problem_shape = make_shape((int) max_shape_m, (int) shape_n, (int) shape_k, (int) num_problems);
+
+    auto ptr_A = reinterpret_cast<ElementInput*>(const_cast<void*>(mat_a));
+    auto ptr_B = reinterpret_cast<ElementInput*>(const_cast<void*>(mat_b));
+    auto ptr_SFA = reinterpret_cast<ElementBlockScale*>(const_cast<float*>(scales_a));
+    auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(const_cast<float*>(scales_b));
+    auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
+    auto ptr_Offset = reinterpret_cast<int32_t*>(const_cast<int64_t*>(problem_m_offsets));
+
+    int32_t ld_a = shape_k;
+    int32_t stride_a = max_shape_m * shape_k;
+    int32_t ld_b = shape_k;
+    int32_t stride_b = shape_n * shape_k;
+    int32_t ld_d = shape_n;
+    int32_t stride_d = max_shape_m * shape_n;
+
+    typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
+    typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
+    typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(problem_shape).stride();
+    typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(problem_shape).stride();
+    typename KT::StrideD dD = make_stride(ld_d, Int<1>{}, stride_d);
+
+    Arguments args = {ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD, ptr_Offset};
+
+    Params kernel_params = GemmKernel::to_underlying_arguments(problem_shape, args);
+    auto kernel_ptr = &cutlass::device_kernel<GemmKernel>;
+
+    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
+    auto result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel cannot launch: %s", cudaGetErrorString(result));
+
+    cudaLaunchConfig_t launch_config;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
@@ -993,7 +1059,7 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -1026,7 +1092,7 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;

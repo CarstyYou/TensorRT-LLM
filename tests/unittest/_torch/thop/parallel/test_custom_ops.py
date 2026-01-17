@@ -77,6 +77,7 @@ def test_register_fake(custom_ops):
         "trtllm::fused_topk_softmax",
         "trtllm::fp8_batched_quantize_1x128_permute102",
         "trtllm::fp8_block_scaling_moe_gemm",
+        "trtllm::fp8_block_scaling_moe_gemm_out",
         "trtllm::fp8_block_scaling_bmm_out",
         "trtllm::fp8_block_scaling_bmm",
         "trtllm::fp4_batched_quantize",
