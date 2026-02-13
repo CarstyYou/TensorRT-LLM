@@ -396,6 +396,17 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
 #endif
 }
 
+template <typename InputType, typename OutputType, int WarpsPerBlock = 4>
+__global__ void scale_1x128_kernel_sm120(
+    OutputType* __restrict__ fp8_output,               
+    int32_t* __restrict__ scale_output,                      
+    const InputType* __restrict__ input,                   
+    int64_t token_num,
+    int64_t size_k)                     
+{
+  // TODO Carsty: Implement this
+}
+
 // input: [dim_y, dim_h, dim_x]
 // output: [dim_h, dim_y, dim_x], cs[dim_h, dim_x/128, padding(dim_y)]
 template <typename InputType, typename OutputType, typename ScaleType = float>
@@ -772,9 +783,8 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
-void moe_gemm_dispatch_sm120(void const* mat_a, void const* mat_b, void* mat_d, int64_t const* problem_m_offsets,
-    size_t num_problems, size_t max_shape_m, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a,
-    float const* scales_b, int num_device_sms = kNumDeviceSMs)
+void moe_gemm_dispatch_sm120(__nv_fp8_e4m3 const* mat_a, __nv_fp8_e4m3 const* mat_b, __nv_bfloat16* mat_d, size_t num_problems, int64_t const* problem_m_offsets,
+    size_t max_shape_m, size_t shape_n, size_t shape_k, float const* scales_a, float const* scales_b, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
@@ -936,6 +946,24 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
     if (kNumDeviceSMs < 0)
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    auto arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 120)
+    {
+        printf("moe_gemm_dispatch_sm120\n");
+        printf("num_problems: %d\n", (int)num_problems);
+        printf("max_shape_m: %d\n", (int)max_shape_m);
+        printf("expected_m: %d\n", (int)expected_m);
+        printf("max_shape_m_padded: %d\n", (int)max_shape_m_padded);
+        printf("shape_n: %d\n", (int)shape_n);
+        printf("shape_k: %d\n", (int)shape_k);
+        return;
+        if (internal_quantize_a) {
+
+        }
+        moe_gemm_dispatch_sm120(fp8_mat_a, fp8_mat_b, mat_d,num_problems, problem_m_offsets, max_shape_m, shape_n, shape_k,
+            scales_a, scales_b, stream);
+        return;
     }
 
     if (internal_quantize_a)
