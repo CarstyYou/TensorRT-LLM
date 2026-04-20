@@ -32,6 +32,7 @@
 #include "fp8_blockscale_tma_utils.cuh"
 #include "sm120_blockwise_gemm/sm120_fp8_gemm_1d1d.cuh"
 #include "sm120_blockwise_gemm/sm120_fp8_moe_gemm_1d1d.cuh"
+#include "sm120_blockwise_gemm/sm120_fp8_swapab_1d1d.cuh"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -774,6 +775,71 @@ void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
+// SwapAB kernel launch for M<=8: swaps A<->B, SFA<->SFB at dispatch level.
+// Kernel sees problem_shape = (N, M, K, L) with TileM covering N (large) and TileN covering M (small).
+// Epilogue does STG scatter store with transpose: accum[i][j] -> D[j][i].
+// k_slices=1 (no sliced-K), workspace=nullptr.
+template <int TileM, int TileN, int TileK, int NumStages>
+void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b,
+    int64_t ld_b, int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, float* scales_a,
+    int64_t stride_scales_a, float* scales_b, int64_t stride_scales_b, uint32_t num_problems, uint32_t shape_m,
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+    using ElementInput = cute::float_e4m3_t;
+    using ElementOutput = cute::bfloat16_t;
+    using ElementBlockScale = int32_t;
+    using KT = sm120_swapab::SM120BlockScaledSwapABBuilder<TileM, TileN, TileK, NumStages>;
+    using SwapABKernel = sm120_swapab::SM120BlockScaledSwapABKernel<KT>;
+    using ProblemShape = typename SwapABKernel::ProblemShape;
+
+    // Swap M<->N for kernel problem shape
+    ProblemShape ps_kernel = make_shape((int) shape_n, (int) shape_m, (int) shape_k, (int) num_problems);
+
+    // Swap A<->B pointers and strides
+    auto ptr_A_kernel = reinterpret_cast<ElementInput*>(mat_b);           // A_kernel = B_user
+    auto ptr_B_kernel = reinterpret_cast<ElementInput*>(mat_a);           // B_kernel = A_user
+    auto ptr_SFA_kernel = reinterpret_cast<ElementBlockScale*>(scales_b); // SFA_kernel = SFB_user
+    auto ptr_SFB_kernel = reinterpret_cast<ElementBlockScale*>(scales_a); // SFB_kernel = SFA_user
+    auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
+
+    typename KT::StrideA dA_k = make_stride(ld_b, Int<1>{}, stride_b); // A_kernel stride = B_user stride
+    typename KT::StrideB dB_k = make_stride(ld_a, Int<1>{}, stride_a); // B_kernel stride = A_user stride
+    typename KT::StrideSFA dSFA_k = KT::deduce_sfa_layout(ps_kernel).stride();
+    typename KT::StrideSFB dSFB_k = KT::deduce_sfb_layout(ps_kernel).stride();
+    typename KT::StrideD dD_k = make_stride(ld_d, Int<1>{}, stride_d);
+
+    typename SwapABKernel::Arguments args
+        = {ptr_A_kernel, dA_k, ptr_B_kernel, dB_k, ptr_SFA_kernel, dSFA_k, ptr_SFB_kernel, dSFB_k, ptr_D, dD_k};
+
+    auto kernel_params = SwapABKernel::to_underlying_arguments(ps_kernel, args);
+    auto kernel_ptr = &cutlass::device_kernel<SwapABKernel>;
+
+    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SwapABKernel::kSmemSize);
+    auto result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 swapab kernel cannot launch: %s", cudaGetErrorString(result));
+
+    cudaLaunchConfig_t launch_config;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+
+    launch_config.gridDim = SwapABKernel::get_grid_shape(kernel_params);
+    launch_config.blockDim = SwapABKernel::get_block_shape();
+    launch_config.dynamicSmemBytes = SwapABKernel::kSmemSize;
+    launch_config.stream = stream;
+    launch_config.attrs = attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
+
+    result = cudaGetLastError();
+    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 swapab kernel runtime error: %s", cudaGetErrorString(result));
+}
+
 void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
     uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
 {
@@ -790,6 +856,15 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     int64_t ld_d = shape_n;
     constexpr int64_t stride = 0;
     constexpr uint32_t num_problems = 1;
+
+    // SwapAB path for small M: swap A<->B so TileM=64 covers N (large dim),
+    // TileN=8 covers M (small dim), eliminating padding waste.
+    if (shape_m <= 8)
+    {
+        launch_sm120_swapab_kernel<64, 8, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+        return;
+    }
 
     // Hardware-utilization-driven tile dispatch: pick largest tile (highest AI)
     // that meets utilization criteria. Candidates (high->low AI):
@@ -1146,6 +1221,14 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     if (num_device_sms < 0)
     {
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+
+    // SwapAB path for small M in BMM
+    if (shape_m <= 8)
+    {
+        launch_sm120_swapab_kernel<64, 8, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+        return;
     }
 
     // Hardware-utilization-driven dispatch, accounting for batch size (num_problems)
