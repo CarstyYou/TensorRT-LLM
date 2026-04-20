@@ -714,7 +714,7 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
-template <int TileM, int TileN, int NumStages>
+template <int TileM, int TileN, int TileK, int NumStages>
 void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b, int64_t ld_b,
     int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, float* scales_a, int64_t stride_scales_a,
     float* scales_b, int64_t stride_scales_b, uint32_t num_problems, uint32_t shape_m, uint32_t shape_n,
@@ -728,7 +728,7 @@ void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<TileM, TileN, NumStages>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<TileM, TileN, TileK, NumStages>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -791,14 +791,31 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     constexpr int64_t stride = 0;
     constexpr uint32_t num_problems = 1;
 
-    if (shape_m <= 64)
+    // Hardware-utilization-driven tile dispatch: pick largest tile (highest AI)
+    // that meets utilization criteria. Candidates (high->low AI):
+    // 128x128k64, 64x128k64, 32x128k128 (fallback).
+    int min_tiles = num_device_sms / 2;
+    auto can_use = [&](int tile_m, int tile_n)
     {
-        launch_sm120_gemm_kernel<32, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+        int num_m = (shape_m + tile_m - 1) / tile_m;
+        int num_n = (shape_n + tile_n - 1) / tile_n;
+        int tiles = num_m * num_n;
+        return shape_m >= static_cast<uint32_t>(tile_m) && num_m >= 2 && tiles >= min_tiles;
+    };
+
+    if (can_use(128, 128))
+    {
+        launch_sm120_gemm_kernel<128, 128, 64, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
+    else if (can_use(64, 128))
+    {
+        launch_sm120_gemm_kernel<64, 128, 64, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
             scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
     }
     else
     {
-        launch_sm120_gemm_kernel<64, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+        launch_sm120_gemm_kernel<32, 128, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
             scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
     }
 }
@@ -908,7 +925,7 @@ void grouped_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __n
     // so we can promise m_padded < max_shape_m_padded
     int64_t m_padded = sm120_blockscaled_gemm::compute_padded_offset(max_shape_m, num_problems);
 
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128, 4>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledMoeKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -1131,14 +1148,29 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
 
-    if (shape_m <= 64)
+    // Hardware-utilization-driven dispatch, accounting for batch size (num_problems)
+    int min_tiles = num_device_sms / 2;
+    auto can_use = [&](int tile_m, int tile_n)
     {
-        launch_sm120_gemm_kernel<32, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+        int num_m = (shape_m + tile_m - 1) / tile_m;
+        int num_n = (shape_n + tile_n - 1) / tile_n;
+        int tiles = num_m * num_n * static_cast<int>(num_problems);
+        return shape_m >= static_cast<uint32_t>(tile_m) && num_m >= 2 && tiles >= min_tiles;
+    };
+
+    if (can_use(128, 128))
+    {
+        launch_sm120_gemm_kernel<128, 128, 64, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
+    else if (can_use(64, 128))
+    {
+        launch_sm120_gemm_kernel<64, 128, 64, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
             scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
     }
     else
     {
-        launch_sm120_gemm_kernel<64, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+        launch_sm120_gemm_kernel<32, 128, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
             scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
     }
 }
