@@ -775,15 +775,57 @@ void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
+// Smallest S such that n_blocks * S >= sm_count AND S | (K/512).
+// Shared by launch_sm120_swapab_kernel (dispatch-time) and the Runner's
+// getWorkspaceSize (thop-time predict) — both callers MUST use the same
+// heuristic so workspace allocation matches the actual launch decision.
+static inline int compute_k_slices_sm120_swapab(int n_blocks, int shape_k, int sm_count)
+{
+    int sf_groups = shape_k / 512;
+    if (sf_groups <= 1)
+    {
+        return 1;
+    }
+    for (int s = 1; s <= sf_groups; s++)
+    {
+        if (sf_groups % s != 0)
+        {
+            continue;
+        }
+        if (n_blocks * s >= sm_count)
+        {
+            return s;
+        }
+    }
+    return sf_groups;
+}
+
+// FP32 workspace -> BF16 output, with SwapAB transpose baked in.
+// workspace layout is N_real-major (kernel wrote accum[i][j] -> ws[j + i*ld_src]).
+// Output is M_real-major (D[m * ld_dst + n]).
+__global__ void swapab_convert_fp32_to_bf16(
+    __nv_bfloat16* __restrict__ dst, float const* __restrict__ src, int M_real, int N_real, int ld_dst, int ld_src)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int m = idx / N_real;
+    int n = idx % N_real;
+    if (m < M_real && n < N_real)
+    {
+        dst[m * ld_dst + n] = __float2bfloat16(src[n + m * ld_src]);
+    }
+}
+
 // SwapAB kernel launch for M<=8: swaps A<->B, SFA<->SFB at dispatch level.
 // Kernel sees problem_shape = (N, M, K, L) with TileM covering N (large) and TileN covering M (small).
 // Epilogue does STG scatter store with transpose: accum[i][j] -> D[j][i].
-// k_slices=1 (no sliced-K), workspace=nullptr.
+// When `workspace != nullptr` and compute_k_slices decides k_slices > 1, the kernel accumulates FP32 via
+// atomicAdd into workspace and a post-launch convert kernel writes BF16 into mat_d.
 template <int TileM, int TileN, int TileK, int NumStages>
 void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b,
     int64_t ld_b, int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, float* scales_a,
     int64_t stride_scales_a, float* scales_b, int64_t stride_scales_b, uint32_t num_problems, uint32_t shape_m,
-    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, float* workspace = nullptr,
+    int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
@@ -815,7 +857,22 @@ void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stri
     typename SwapABKernel::Arguments args
         = {ptr_A_kernel, dA_k, ptr_B_kernel, dB_k, ptr_SFA_kernel, dSFA_k, ptr_SFB_kernel, dSFB_k, ptr_D, dD_k};
 
-    auto kernel_params = SwapABKernel::to_underlying_arguments(ps_kernel, args);
+    int n_blocks = ((int) shape_n + TileM - 1) / TileM;
+    int k_slices = (workspace != nullptr) ? compute_k_slices_sm120_swapab(n_blocks, (int) shape_k, num_device_sms) : 1;
+    if (k_slices > 1)
+    {
+        size_t ws_bytes = (size_t) shape_n * shape_m * num_problems * sizeof(float);
+        auto memset_err = cudaMemsetAsync(workspace, 0, ws_bytes, stream);
+        TLLM_CHECK_WITH_INFO(
+            memset_err == cudaSuccess, "sm120 swapab workspace memset failed: %s", cudaGetErrorString(memset_err));
+    }
+    else
+    {
+        // Normalize: the kernel's nullptr check skips atomicAdd path.
+        workspace = nullptr;
+    }
+
+    auto kernel_params = SwapABKernel::to_underlying_arguments(ps_kernel, args, workspace, k_slices);
     auto kernel_ptr = &cutlass::device_kernel<SwapABKernel>;
 
     cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, SwapABKernel::kSmemSize);
@@ -838,10 +895,23 @@ void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stri
 
     result = cudaGetLastError();
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 swapab kernel runtime error: %s", cudaGetErrorString(result));
+
+    if (k_slices > 1)
+    {
+        // FP32 workspace -> BF16 output with transpose.
+        // ld_src = shape_n (workspace row-major over N for each M); ld_dst = shape_n (output row-major over N).
+        int total = static_cast<int>(shape_m) * static_cast<int>(shape_n) * static_cast<int>(num_problems);
+        swapab_convert_fp32_to_bf16<<<(total + 255) / 256, 256, 0, stream>>>(
+            mat_d, workspace, (int) shape_m, (int) shape_n, (int) shape_n, (int) shape_n);
+        result = cudaGetLastError();
+        TLLM_CHECK_WITH_INFO(
+            result == cudaSuccess, "sm120 swapab convert kernel runtime error: %s", cudaGetErrorString(result));
+    }
 }
 
 void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
-    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, float* workspace = nullptr,
+    int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
@@ -858,11 +928,13 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     constexpr uint32_t num_problems = 1;
 
     // SwapAB path for small M: swap A<->B so TileM=64 covers N (large dim),
-    // TileN=8 covers M (small dim), eliminating padding waste.
+    // TileN=8 covers M (small dim), eliminating padding waste. When workspace
+    // is provided and compute_k_slices decides k_slices>1, the SwapAB kernel
+    // uses sliced-K + atomicAdd to keep SMs busy on small-N shapes.
     if (shape_m <= 8)
     {
         launch_sm120_swapab_kernel<64, 8, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
-            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, workspace, num_device_sms);
         return;
     }
 
@@ -896,7 +968,8 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
-    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream)
+    uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, float* scales_a, float* scales_b, cudaStream_t stream,
+    float* workspace = nullptr)
 {
     if (shape_m == 0)
     {
@@ -911,7 +984,7 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
     }
     if (arch == 120)
     {
-        gemm_dispatch_sm120(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
+        gemm_dispatch_sm120(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream, workspace);
         return;
     }
     gemm_dispatch(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
@@ -1216,18 +1289,19 @@ void strided_batch_gemm_dispatch_sm89(__nv_fp8_e4m3* mat_a, int ld_a, int stride
 void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, __nv_fp8_e4m3* mat_b, int ld_b,
     int stride_b, __nv_bfloat16* mat_d, int ld_d, int stride_d, float* scales_a, int stride_scales_a, float* scales_b,
     uint32_t num_problems, uint32_t shape_m, uint32_t shape_n, uint32_t shape_k, cudaStream_t stream,
-    int num_device_sms = kNumDeviceSMs)
+    float* workspace = nullptr, int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
 
-    // SwapAB path for small M in BMM
+    // SwapAB path for small M in BMM (see gemm_dispatch_sm120 for workspace/sliced-K details).
     if (shape_m <= 8)
     {
         launch_sm120_swapab_kernel<64, 8, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
-            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, workspace,
+            num_device_sms);
         return;
     }
 
@@ -1262,7 +1336,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     int stride_a, int stride_scales_a, __nv_bfloat16 const* mat_b, __nv_fp8_e4m3* fp8_mat_b, float* scales_b, int ld_b,
     int stride_b, __nv_bfloat16* mat_d, int ld_d, int stride_d, uint32_t num_problems, uint32_t shape_m,
     uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, bool internal_quantize_a = true,
-    bool internal_quantize_b = true)
+    bool internal_quantize_b = true, float* workspace = nullptr)
 {
     if (shape_m == 0)
     {
@@ -1294,7 +1368,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
     if (arch == 120)
     {
         strided_batch_gemm_dispatch_sm120(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
-            scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream);
+            scales_a, stride_scales_a, scales_b, num_problems, shape_m, shape_n, shape_k, stream, workspace);
         return;
     }
     strided_batch_gemm_dispatch(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d, stride_d, scales_a,

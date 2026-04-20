@@ -71,7 +71,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 @pytest.mark.parametrize(
     "k, n",
     [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
-     (2048, 7168), (1024, 1024)],
+     (2048, 7168), (1024, 1024), (5120, 5120)],
 )
 @pytest.mark.parametrize(
     "m",
@@ -164,7 +164,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 )
 @pytest.mark.parametrize(
     "k, n",
-    [(7168, 2112), (512, 32768), (16384, 7168), (2048, 7168)],
+    [(7168, 2112), (512, 32768), (16384, 7168), (2048, 7168), (5120, 5120)],
 )
 @pytest.mark.parametrize(
     "m",
