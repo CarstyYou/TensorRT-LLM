@@ -228,8 +228,12 @@ struct SM120BlockScaledKernel
         auto tAsA = block_tma_a.partition_D(sA);
         auto tBsB = block_tma_b.partition_D(sB);
 
-        auto [ab_full_mbar, ab_empty_mbar, sf_full_mbar, sf_empty_mbar, store_full_mbar, store_empty_mbar]
-            = get_mbarriers(shared_storage);
+        // Use cute::get<> instead of structured binding so these variables can be captured
+        // by the lambda below without triggering nvcc "#3357-D: capturing structured bindings
+        // is a C++20 feature" under C++17.
+        auto mbars = get_mbarriers(shared_storage);
+        auto ab_full_mbar = cute::get<0>(mbars);
+        auto ab_empty_mbar = cute::get<1>(mbars);
 
         int32_t k_tile_count = sf_tile_count * KT::kNumTileKPerSF;
         for (int32_t k_tile_idx = 0; k_tile_idx < k_tile_count; k_tile_idx += KT::AB_Stages)
@@ -302,8 +306,15 @@ struct SM120BlockScaledKernel
         auto tCrSFB_frg = KT::transform_fragment_for_qmma(tCrSFB);
 
         cute::clear(accum);
-        auto [ab_full_mbar, ab_empty_mbar, sf_full_mbar, sf_empty_mbar, store_full_mbar, store_empty_mbar]
-            = get_mbarriers(shared_storage);
+        // See note on cute::get<> usage in load() for the C++17 structured-binding-capture
+        // workaround.
+        auto mbars = get_mbarriers(shared_storage);
+        auto ab_full_mbar = cute::get<0>(mbars);
+        auto ab_empty_mbar = cute::get<1>(mbars);
+        auto sf_full_mbar = cute::get<2>(mbars);
+        auto sf_empty_mbar = cute::get<3>(mbars);
+        auto store_full_mbar = cute::get<4>(mbars);
+        auto store_empty_mbar = cute::get<5>(mbars);
         for (int32_t sf_tile_idx = 0; sf_tile_idx < sf_tile_count - 1; ++sf_tile_idx)
         {
             sf_full_mbar[0].wait(sf_phase);
@@ -473,7 +484,6 @@ struct SM120BlockScaledKernel
     void operator()(Params const& params, char* smem_buf)
     {
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
-        int thread_idx = int(threadIdx.x);
         int warp_idx = canonical_warp_idx_sync();
         int lane_predicate = cute::elect_one_sync();
         bool is_tma_thread = warp_idx == 0 && lane_predicate;
