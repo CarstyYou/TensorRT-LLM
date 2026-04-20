@@ -801,17 +801,21 @@ static inline int compute_k_slices_sm120_swapab(int n_blocks, int shape_k, int s
 }
 
 // FP32 workspace -> BF16 output, with SwapAB transpose baked in.
-// workspace layout is N_real-major (kernel wrote accum[i][j] -> ws[j + i*ld_src]).
-// Output is M_real-major (D[m * ld_dst + n]).
-__global__ void swapab_convert_fp32_to_bf16(
-    __nv_bfloat16* __restrict__ dst, float const* __restrict__ src, int M_real, int N_real, int ld_dst, int ld_src)
+// Per-batch workspace layout is N_real-major (kernel wrote accum[i][j] -> ws[j + i*ld_src]).
+// Per-batch output is M_real-major (D[m * ld_dst + n]).
+// L handles BMM: dst/src are advanced by stride_d/stride_src per batch.
+__global__ void swapab_convert_fp32_to_bf16(__nv_bfloat16* __restrict__ dst, float const* __restrict__ src, int M_real,
+    int N_real, int L, int64_t ld_dst, int64_t stride_d, int64_t ld_src, int64_t stride_src)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int m = idx / N_real;
-    int n = idx % N_real;
-    if (m < M_real && n < N_real)
+    int per_batch = M_real * N_real;
+    int l = idx / per_batch;
+    int rem = idx % per_batch;
+    int m = rem / N_real;
+    int n = rem % N_real;
+    if (l < L && m < M_real && n < N_real)
     {
-        dst[m * ld_dst + n] = __float2bfloat16(src[n + m * ld_src]);
+        dst[l * stride_d + m * ld_dst + n] = __float2bfloat16(src[l * stride_src + n + m * ld_src]);
     }
 }
 
@@ -857,8 +861,12 @@ void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stri
     typename SwapABKernel::Arguments args
         = {ptr_A_kernel, dA_k, ptr_B_kernel, dB_k, ptr_SFA_kernel, dSFA_k, ptr_SFB_kernel, dSFB_k, ptr_D, dD_k};
 
+    // For BMM, each batch contributes its own n_blocks independently to SM occupancy,
+    // so the "effective n_blocks" for compute_k_slices is n_blocks * num_problems.
     int n_blocks = ((int) shape_n + TileM - 1) / TileM;
-    int k_slices = (workspace != nullptr) ? compute_k_slices_sm120_swapab(n_blocks, (int) shape_k, num_device_sms) : 1;
+    int effective_n_blocks = n_blocks * static_cast<int>(num_problems);
+    int k_slices
+        = (workspace != nullptr) ? compute_k_slices_sm120_swapab(effective_n_blocks, (int) shape_k, num_device_sms) : 1;
     if (k_slices > 1)
     {
         size_t ws_bytes = (size_t) shape_n * shape_m * num_problems * sizeof(float);
@@ -898,11 +906,16 @@ void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stri
 
     if (k_slices > 1)
     {
-        // FP32 workspace -> BF16 output with transpose.
-        // ld_src = shape_n (workspace row-major over N for each M); ld_dst = shape_n (output row-major over N).
+        // FP32 workspace -> BF16 output with SwapAB transpose.
+        // Per-batch workspace stride = shape_n * shape_m (N_real * M_real, tightly packed).
+        // Output stride = stride_d for BMM (caller-supplied), shape_n * shape_m for GEMM (num_problems=1).
         int total = static_cast<int>(shape_m) * static_cast<int>(shape_n) * static_cast<int>(num_problems);
-        swapab_convert_fp32_to_bf16<<<(total + 255) / 256, 256, 0, stream>>>(
-            mat_d, workspace, (int) shape_m, (int) shape_n, (int) shape_n, (int) shape_n);
+        int64_t const ws_stride_l = static_cast<int64_t>(shape_m) * static_cast<int64_t>(shape_n);
+        int64_t const out_stride_l = (num_problems > 1) ? stride_d : ws_stride_l;
+        swapab_convert_fp32_to_bf16<<<(total + 255) / 256, 256, 0, stream>>>(mat_d, workspace, (int) shape_m,
+            (int) shape_n, (int) num_problems,
+            /*ld_dst=*/(int64_t) shape_n, /*stride_d=*/out_stride_l,
+            /*ld_src=*/(int64_t) shape_n, /*stride_src=*/ws_stride_l);
         result = cudaGetLastError();
         TLLM_CHECK_WITH_INFO(
             result == cudaSuccess, "sm120 swapab convert kernel runtime error: %s", cudaGetErrorString(result));

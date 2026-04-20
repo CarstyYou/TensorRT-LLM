@@ -281,7 +281,11 @@ struct SM120BlockScaledSwapABKernel
 
         if (params.ptr_workspace)
         {
-            // Sliced-K: atomicAdd FP32 to workspace
+            // Sliced-K: atomicAdd FP32 to workspace.
+            // blockIdx.z encodes (l, slice) when k_slices>1 — same decode as operator() below.
+            int l_coord = (params.k_slices > 1) ? (int(blockIdx.z) / params.k_slices) : int(blockIdx.z);
+            // Per-batch workspace stride: N_real * M_real (kernel-view M_k * N_k).
+            int64_t ws_stride_l = (int64_t) M_k * (int64_t) N_k;
             cute::for_each(cute::make_int_sequence<kAccumSize>{},
                 [&](auto i)
                 {
@@ -289,7 +293,8 @@ struct SM120BlockScaledSwapABKernel
                     int n_in = get<1>(tCcD(i));
                     if (m_base + m_in < M_k && n_base + n_in < N_k)
                     {
-                        int addr = (m_base + m_in) + (n_base + n_in) * params.ld_D;
+                        int64_t addr = l_coord * ws_stride_l + (int64_t) (m_base + m_in)
+                            + (int64_t) (n_base + n_in) * params.ld_D;
                         atomicAdd(&params.ptr_workspace[addr], accum(i));
                     }
                 });
@@ -329,8 +334,10 @@ struct SM120BlockScaledSwapABKernel
         bool is_tma_warp = (warp_idx >= KT::kNumMathWarps);
 
         auto [M, N, K, L] = params.problem_shape;
-        // Sliced-K: compute per-slice K range
-        int k_slice_idx = (params.k_slices > 1) ? blockIdx.z : 0;
+        // Sliced-K: blockIdx.z encodes (l_coord, k_slice_idx) laid out as l_coord * k_slices + slice.
+        // When k_slices==1, blockIdx.z == l_coord (single-slice fast path preserved).
+        int k_slice_idx = (params.k_slices > 1) ? (int(blockIdx.z) % params.k_slices) : 0;
+        int l_coord = (params.k_slices > 1) ? (int(blockIdx.z) / params.k_slices) : int(blockIdx.z);
         int K_per_slice = K / params.k_slices;
         int32_t sf_tile_count = K_per_slice / 512;
         int32_t k_tile_offset = k_slice_idx * (K_per_slice / KT::kTileK);
@@ -370,7 +377,7 @@ struct SM120BlockScaledSwapABKernel
 
             int m_block = blockIdx.x;
             int n_block = blockIdx.y;
-            int l_coord = (params.k_slices > 1) ? 0 : blockIdx.z;
+            // l_coord is already decoded above from blockIdx.z.
 
             if (warp_idx == ab_warp_idx && lane_predicate)
             {

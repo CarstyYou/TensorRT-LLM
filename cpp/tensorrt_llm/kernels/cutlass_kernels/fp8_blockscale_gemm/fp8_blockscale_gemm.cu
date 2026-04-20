@@ -268,22 +268,22 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
     expected_m_ = shape_m;
     size_t base = getWorkspaceSizeBase(shape_m * top_k, shape_n, shape_k, num_problems);
 
-    // SwapAB sliced-K workspace (sm120, M<=8, num_problems==1). Precise strategy:
-    // predict k_slices and only reserve bytes when sliced-K will actually activate,
-    // so most DSV3 shapes (N_blocks >= sm_count) incur zero allocation.
+    // SwapAB sliced-K workspace (sm120, M<=8). Precise strategy: predict k_slices
+    // and only reserve bytes when sliced-K will actually activate, so most DSV3
+    // shapes (N_blocks * L >= sm_count) incur zero allocation.
     //
-    // BMM (num_problems > 1) is excluded because the SwapAB kernel's workspace
-    // atomicAdd indexing is single-batch (see sm120_fp8_swapab_1d1d.cuh: addr
-    // lacks an L-dimension offset). BMM still takes the SwapAB path for M<=8
-    // but runs with k_slices=1 (no sliced-K).
-    if (tensorrt_llm::common::getSMVersion() == 120 && shape_m <= 8 && num_problems == 1)
+    // For BMM (num_problems > 1), each batch's N-blocks count independently toward
+    // SM occupancy, so the effective n_blocks for the heuristic is n_blocks * L.
+    // Kernel's atomicAdd indexing includes an L offset (see sm120_fp8_swapab_1d1d.cuh).
+    if (tensorrt_llm::common::getSMVersion() == 120 && shape_m <= 8)
     {
         int sm_count = tensorrt_llm::common::getMultiProcessorCount();
         int n_blocks = static_cast<int>((shape_n + 63) / 64); // TileM = 64
-        int k_slices = compute_k_slices_sm120_swapab(n_blocks, static_cast<int>(shape_k), sm_count);
+        int effective_n_blocks = n_blocks * static_cast<int>(num_problems);
+        int k_slices = compute_k_slices_sm120_swapab(effective_n_blocks, static_cast<int>(shape_k), sm_count);
         if (k_slices > 1)
         {
-            size_t swapab_bytes = shape_n * shape_m * sizeof(float);
+            size_t swapab_bytes = shape_n * shape_m * num_problems * sizeof(float);
             // Single workspace buffer shared across uses: take the max.
             base = std::max(base, swapab_bytes);
         }
