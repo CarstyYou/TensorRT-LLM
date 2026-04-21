@@ -914,7 +914,7 @@ void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stri
         int64_t const out_stride_l = (num_problems > 1) ? stride_d : ws_stride_l;
         swapab_convert_fp32_to_bf16<<<(total + 255) / 256, 256, 0, stream>>>(mat_d, workspace, (int) shape_m,
             (int) shape_n, (int) num_problems,
-            /*ld_dst=*/(int64_t) shape_n, /*stride_dst=*/out_stride_l,
+            /*ld_dst=*/ld_d, /*stride_dst=*/out_stride_l,
             /*ld_src=*/(int64_t) shape_n, /*stride_src=*/ws_stride_l);
         result = cudaGetLastError();
         TLLM_CHECK_WITH_INFO(

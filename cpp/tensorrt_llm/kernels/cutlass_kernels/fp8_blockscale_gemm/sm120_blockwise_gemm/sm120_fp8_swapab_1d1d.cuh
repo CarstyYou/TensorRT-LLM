@@ -293,8 +293,11 @@ struct SM120BlockScaledSwapABKernel
                     int n_in = get<1>(tCcD(i));
                     if (m_base + m_in < M_k && n_base + n_in < N_k)
                     {
+                        // Workspace is tight (ws_stride_l = M_k * N_k); use M_k as the inner
+                        // stride. Don't use params.ld_D — that's the caller's output ldd,
+                        // which can differ from M_k when `out` is a strided view.
                         int64_t addr = l_coord * ws_stride_l + (int64_t) (m_base + m_in)
-                            + (int64_t) (n_base + n_in) * params.ld_D;
+                            + (int64_t) (n_base + n_in) * (int64_t) M_k;
                         atomicAdd(&params.ptr_workspace[addr], accum(i));
                     }
                 });
