@@ -803,9 +803,9 @@ static inline int compute_k_slices_sm120_swapab(int n_blocks, int shape_k, int s
 // FP32 workspace -> BF16 output, with SwapAB transpose baked in.
 // Per-batch workspace layout is N_real-major (kernel wrote accum[i][j] -> ws[j + i*ld_src]).
 // Per-batch output is M_real-major (D[m * ld_dst + n]).
-// L handles BMM: dst/src are advanced by stride_d/stride_src per batch.
+// L handles BMM: dst/src are advanced by stride_dst/stride_src per batch.
 __global__ void swapab_convert_fp32_to_bf16(__nv_bfloat16* __restrict__ dst, float const* __restrict__ src, int M_real,
-    int N_real, int L, int64_t ld_dst, int64_t stride_d, int64_t ld_src, int64_t stride_src)
+    int N_real, int L, int64_t ld_dst, int64_t stride_dst, int64_t ld_src, int64_t stride_src)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int per_batch = M_real * N_real;
@@ -815,7 +815,7 @@ __global__ void swapab_convert_fp32_to_bf16(__nv_bfloat16* __restrict__ dst, flo
     int n = rem % N_real;
     if (l < L && m < M_real && n < N_real)
     {
-        dst[l * stride_d + m * ld_dst + n] = __float2bfloat16(src[l * stride_src + n + m * ld_src]);
+        dst[l * stride_dst + m * ld_dst + n] = __float2bfloat16(src[l * stride_src + n + m * ld_src]);
     }
 }
 
@@ -908,13 +908,13 @@ void launch_sm120_swapab_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stri
     {
         // FP32 workspace -> BF16 output with SwapAB transpose.
         // Per-batch workspace stride = shape_n * shape_m (N_real * M_real, tightly packed).
-        // Output stride = stride_d for BMM (caller-supplied), shape_n * shape_m for GEMM (num_problems=1).
+        // Output stride = stride_d for BMM (caller-supplied D tensor), shape_n * shape_m for GEMM.
         int total = static_cast<int>(shape_m) * static_cast<int>(shape_n) * static_cast<int>(num_problems);
         int64_t const ws_stride_l = static_cast<int64_t>(shape_m) * static_cast<int64_t>(shape_n);
         int64_t const out_stride_l = (num_problems > 1) ? stride_d : ws_stride_l;
         swapab_convert_fp32_to_bf16<<<(total + 255) / 256, 256, 0, stream>>>(mat_d, workspace, (int) shape_m,
             (int) shape_n, (int) num_problems,
-            /*ld_dst=*/(int64_t) shape_n, /*stride_d=*/out_stride_l,
+            /*ld_dst=*/(int64_t) shape_n, /*stride_dst=*/out_stride_l,
             /*ld_src=*/(int64_t) shape_n, /*stride_src=*/ws_stride_l);
         result = cudaGetLastError();
         TLLM_CHECK_WITH_INFO(
